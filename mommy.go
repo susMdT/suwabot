@@ -1,9 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io/ioutil"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -11,9 +11,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/vmware/govmomi"
 
-	"net/url"
 	"os"
 
 	"math/rand"
@@ -27,10 +25,14 @@ type ConfigFile struct {
 }
 
 type machineGroup struct { //The format for each category
-	name     string
-	machines []string
+	name        string
+	machines    []string
+	domainBoxes []domainMachines //A lab will use this. Its an array of a struct. the struct will have a domain name and an array that contains associated machines in the domain
 }
-
+type domainMachines struct {
+	domainName  string
+	machineName []string
+}
 type messageLog struct {
 	sourceSession []*discordgo.Session
 	sourceMessage []*discordgo.MessageCreate
@@ -39,8 +41,21 @@ type messageLog struct {
 
 var Token string
 var messageHandling messageLog
-var standalone = machineGroup{"standalone", []string{"Shipping", ""}}                                                                        //put all standalone machines here
-var lab1 = machineGroup{"lab1", []string{"WEB01", "WS01", "DOCS", "DEV", "DB01", "CORP-WEB01", "ADMIN-DB", "HERBERT-PC", "WEB-DEV", "DC01"}} //put all lab1 machines here
+var standalone = machineGroup{
+	"standalone",
+	[]string{"Shipping", ""},
+	nil, //has no domainboxes
+}                        //put all standalone machines here
+var lab1 = machineGroup{ //put all lab1 machines here
+	"lab1",
+	[]string{"WEB01", "WS01", "DOCS", "DEV", "DB01", "CORP-WEB01", "ADMIN-DB", "HERBERT-PC", "WEB-DEV", "DC01"}, //all the machines
+	[]domainMachines{
+		{
+			"The Admin Subnet",
+			[]string{".110 ADMIN-DB", ".115 HERBERT-PC", ".120 WEB-DEV", ".105 DC01"}, //the domain joined ones (shitty naming context, dont do this from now on)
+		},
+	},
+}
 
 func (c *ConfigFile) getConfigFile() *ConfigFile {
 
@@ -57,27 +72,6 @@ func (c *ConfigFile) getConfigFile() *ConfigFile {
 		fmt.Println("[-] Cannot read the config.yml file")
 	}
 	return nil
-}
-
-func auth() bool { //Authenticate to vsphere
-
-	const (
-		user     = "" //Declare creds
-		password = ""
-	)
-	u := &url.URL{ //url to send post req to vsphere (aka login)
-		Scheme: "https",
-		Host:   "",
-		Path:   "/sdk/",
-	}
-	ctx := context.Background()                    //idk tbh copy and paste
-	u.User = url.UserPassword(user, password)      //login object
-	client, err := govmomi.NewClient(ctx, u, true) //attempt the login
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Login to vsphere failed, %v", err)
-		os.Exit(1)
-	}
-	return client.IsVC()
 }
 
 func queue(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -119,18 +113,18 @@ func action(s *discordgo.Session, m *discordgo.MessageCreate) { //Bot does stuff
 	if m.Content == "!!bruh" { //debug send message
 		s.ChannelMessageSend(m.ChannelID, "bruh")
 	}
-
-	if m.Content == "!!login status" { //see if i can log into vsphere
-		s.ChannelMessageSend(m.ChannelID, strconv.FormatBool(auth()))
-	}
 	/*
-		defer func() {
-			if panicInfo := recover(); panicInfo != nil {
-				time.Sleep(1)
-				s.ChannelMessageSend(m.ChannelID, "Command brokey, try again? Example: !!reset localhost lab1 or !!reset localhost standalone")
-			}
-		}()
+		if m.Content == "!!login status" { //see if i can log into vsphere
+			s.ChannelMessageSend(m.ChannelID, strconv.FormatBool(auth()))
+		}
 	*/
+	defer func() {
+		if panicInfo := recover(); panicInfo != nil {
+			time.Sleep(1 * time.Second)
+			s.ChannelMessageSend(m.ChannelID, "Command brokey, try again? Example: !!reset localhost lab1 or !!reset localhost standalone")
+		}
+	}()
+
 	if strings.HasPrefix(m.Content, "!!reset") {
 		var wholeString string
 		re := regexp.MustCompile(`!!reset .{0,} .{0,}`)
@@ -148,7 +142,7 @@ func action(s *discordgo.Session, m *discordgo.MessageCreate) { //Bot does stuff
 			validMachine(lab1, hostname, category, s, m)
 		} else {
 			time.Sleep(1 * time.Second)
-			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid category"))
+			s.ChannelMessageSend(m.ChannelID, "Invalid category")
 		}
 	}
 }
@@ -158,64 +152,99 @@ func validMachine(group machineGroup, nameToCheck string, category string, s *di
 		if x == nameToCheck {
 			time.Sleep(1 * time.Second)
 			if valid, domainName := isDomain(group, nameToCheck); valid { //Since isDomain returns two values, create temp var to take the bool valu and check that one
-				resetCheck(domainName, category, s, m)
+				resetCheck(domainName, category, s, m, true)
 				//s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Resetting the %s from %s", domainName, category))
 			} else {
-				resetCheck(nameToCheck, category, s, m)
+				resetCheck(nameToCheck, category, s, m, false)
 				//s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Resetting %s from %s", nameToCheck, category))
 			}
 			return
 		}
 	}
 	time.Sleep(1 * time.Second)
-	s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Values are invalid"))
+	s.ChannelMessageSend(m.ChannelID, "Values are invalid")
 
 }
-func resetCheck(name string, category string, s *discordgo.Session, m *discordgo.MessageCreate) { //funky printing
-	timeLeft := 20  //default 20 seconds
-	percentage := 0 //default empty percentage
+func resetCheck(name string, category string, s *discordgo.Session, m *discordgo.MessageCreate, isDomain bool) { //funky printing
+	timeLeft := 15                       //default 15 seconds
+	percentage := 0                     //default empty percentage
+	votingEmbedObject := newVoteEmbed() //create the embed thing
 
-	voteMessageSent, _ := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Vote to reset %s from %s \nReact with :green_circle: to vote yes, :red_circle: for no", name, category))
-	timeLeftMessage, _ := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Time left: %d", timeLeft))
-	progressBarMessage, _ := s.ChannelMessageSend(m.ChannelID, "Voting Percent: ")
-	fmt.Println("message channel id: ", m.ChannelID, "\nvotemessagesent channel id:", voteMessageSent.ChannelID) //id is valid
-	fmt.Println("voting message message id: ", voteMessageSent.ID)                                               //messageid is null
-	s.MessageReactionAdd(voteMessageSent.ChannelID, voteMessageSent.ID, "\U0001f7e2")                            //reacting to message
-	fmt.Println("debugging here")
-	s.MessageReactionAdd(voteMessageSent.ChannelID, voteMessageSent.ID, "\U0001f534") //can get this by print([f"0x{ord(c):08x}" for c in "🔴"]) in python
+	votingEmbedObject = modifyVoteEmbed(votingEmbedObject, timeLeft, category, name, "■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□□□□□□□□□ 50%")
+	embedMessage, _ := s.ChannelMessageSendEmbed(m.ChannelID, votingEmbedObject) //send the embed vote thing
+	s.MessageReactionAdd(embedMessage.ChannelID, embedMessage.ID, "\U0001f7e2")  //react to the embed
+	s.MessageReactionAdd(embedMessage.ChannelID, embedMessage.ID, "\U0001f534")  //react to the embed
+
 	for timeLeft > 0 {
+		time.Sleep(800 * time.Millisecond)
 		timeLeft -= 1 //every second, lower the timer
 		asciiBar := ""
-		counter := 2                                                                                                        //counter to fill up the percentage bar via division
-		s.ChannelMessageEdit(timeLeftMessage.ChannelID, timeLeftMessage.ID, fmt.Sprintf("Time left: %d", timeLeft))         //edit the timer
-		yesReactionUsers, _ := s.MessageReactions(voteMessageSent.ChannelID, voteMessageSent.ID, "\U0001f7e2", 100, "", "") //counting greens
-		noReactionUsers, _ := s.MessageReactions(voteMessageSent.ChannelID, voteMessageSent.ID, "\U0001f534", 100, "", "")  //counting reds                                                                                       //debug
+
+		yesReactionUsers, _ := s.MessageReactions(embedMessage.ChannelID, embedMessage.ID, "\U0001f7e2", 100, "", "") //counting greens
+		noReactionUsers, _ := s.MessageReactions(embedMessage.ChannelID, embedMessage.ID, "\U0001f534", 100, "", "")  //counting reds
+
 		totalReactions := len(yesReactionUsers) + len(noReactionUsers)
 		percentage = (len(yesReactionUsers) * 100 / totalReactions)
 		nullPercentage := 100 - percentage
-		for counter < percentage {
-			asciiBar += "■"
-			counter += 2
-		}
-		counter = 2 //reset counter back to base
-		for counter < nullPercentage {
-			asciiBar += "□"
-			counter += 2
-		}
+
+		//percentage = 50 //Debugging time values
+		//nullPercentage := 50
+		fillTicks := percentage / 2
+		asciiBar = strings.Repeat("■", fillTicks)
+
+		nullTicks := nullPercentage / 2
+		nullBar := strings.Repeat("□", nullTicks)
+		asciiBar += nullBar
+
 		asciiBarTail := fmt.Sprintf(" %d", percentage)
-		s.ChannelMessageEdit(progressBarMessage.ChannelID, progressBarMessage.ID, "Voting Percent: "+asciiBar+asciiBarTail+"%")
+		votingEmbedObject = modifyVoteEmbed(votingEmbedObject, timeLeft, category, name, asciiBar+asciiBarTail+"%")
+		s.ChannelMessageEditEmbed(embedMessage.ChannelID, embedMessage.ID, votingEmbedObject)
+
 	}
 	if percentage >= 50 { //timer is done, voting time
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Resetting %s from %s", name, category))
+		if isDomain {
+			resetDomain(name, category)
+		} else {
+			resetMachine(name)
+		}
+		s.ChannelMessageSend(m.ChannelID, "Revert finished. Give it some time to breathe.")
 	} else {
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Not enough votes to reset %s from %s", name, category))
 	}
 
 }
+func resetMachine(name string) {
+	switch name { //an unfortunate solution to a shitty mistake. DONT PUT LAST OCTET IN NAME OF BOXES WHENCREATING, ITLL FUCKING ANNOYING THE SHIT OUTTA YOU
+	case "WEB01":
+		name = ".5 WEB01"
+	case "WS01":
+		name = ".10 WS01"
+	case "DOCS":
+		name = ".15 DOCS"
+	case "DEV":
+		name = ".20 DEV"
+	case "DB01":
+		name = ".25 DB01"
+	case "CORP-WEB01":
+		name = ".50 CORP-WEB01"
+	}
+
+	exec.Command(`/bin/bash`, `-c`, fmt.Sprintf(`env GOVC_URL='https://username:pass@vspherehost/sdk' /root/go/bin/govc snapshot.revert -k=true -vm.path="[truenas] %s/%s.vmx" -dc TelcoLabDataCenter "about to test"`, name, name)).Output()
+	exec.Command(`/bin/bash`, `-c`, fmt.Sprintf(`env GOVC_URL=https://username:pass@vspherehost/sdk' /root/go/bin/govc vm.power -on -k=true -dc TelcoLabDataCenter -wait=true -vm.path="[truenas]%s/%s.vmx"`, name, name)).Output()
+}
+func resetDomain(domainName string, category string) {
+	if domainName == "The Admin Subnet" && category == "lab1" {
+		for _, name := range lab1.domainBoxes[0].machineName { //this one is the admin subnet
+			exec.Command(`/bin/bash`, `-c`, fmt.Sprintf(`env GOVC_URL='https://username:pass@vspherehost/sdk' /root/go/bin/govc snapshot.revert -k=true -vm.path="[truenas] %s/%s.vmx" -dc TelcoLabDataCenter "about to test"`, name, name)).Output()
+			exec.Command(`/bin/bash`, `-c`, fmt.Sprintf(`env GOVC_URL='https://username:pass@vspherehost/sdk' /root/go/bin/govc vm.power -on -k=true -dc TelcoLabDataCenter -wait=true -vm.path="[truenas]%s/%s.vmx"`, name, name)).Output()
+		}
+	}
+}
 func isDomain(group machineGroup, nameToCheck string) (bool, string) { //Check if the machine is in a domain. This assumes that the machine is already valid within the group
 	domainMachines1 := []string{"ADMIN-DB", "WEB-DEV", "DC01", "HERBERT-PC"}
 	if doesContain, _ := contains(domainMachines1, nameToCheck); group.name == "lab1" && doesContain {
-		return true, "the Admin Subnet"
+		return true, "The Admin Subnet"
 	}
 	return false, "false"
 }
@@ -235,14 +264,34 @@ func newVoteEmbed() *discordgo.MessageEmbed {
 	var voteEmbed *discordgo.MessageEmbed
 	voteEmbed = &discordgo.MessageEmbed{
 		Title:       "Voting Status",
-		Description: "Time left: ",
+		Description: "Time left", //show time left here
 		Color:       16721189,
-		Fields: []*discordgo.MessageEmbedField
+		Fields: []*discordgo.MessageEmbedField{
+			&discordgo.MessageEmbedField{
+				Name:   "Category: ", //is it lab1, lab2, standalone, etc.
+				Value:  "Name: ",     //Box title or subnet
+				Inline: false,
+			},
+			&discordgo.MessageEmbedField{
+				Name:   "Voting Percentage",
+				Value:  "",
+				Inline: false,
+			},
+		},
 	}
 	return voteEmbed
 }
+
+func modifyVoteEmbed(embedObject *discordgo.MessageEmbed, timeLeft int, category string, name string, percentageBar string) *discordgo.MessageEmbed {
+	embedObject.Description = fmt.Sprintf("Time left: %d", timeLeft)
+	embedObject.Fields[0].Name = category
+	embedObject.Fields[0].Value = "Name: " + name
+	embedObject.Fields[1].Value = percentageBar
+	return embedObject
+}
+
 func main() {
-	auth()
+	//auth()
 
 	var c ConfigFile
 	var dg *discordgo.Session
